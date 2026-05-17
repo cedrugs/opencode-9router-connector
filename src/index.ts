@@ -639,6 +639,24 @@ function toOpenCodeModel(
  * models.dev database (i.e. not for custom gateways like 9router).
  */
 function toConfigModelEntry(m: OpenCodeModel): Record<string, unknown> {
+  // Newer opencode versions (>=1.14.40) consult `modalities.input` to decide
+  // whether the request builder is allowed to attach images / pdfs.  The
+  // legacy `attachment` boolean is still honoured by the dashboard but is no
+  // longer sufficient on its own – without `modalities` the model is gated as
+  // text-only at session start ("Image input not supported").  Mirror the
+  // nested OpenCodeModel capability flags into a flat modality array so both
+  // old and new opencode code paths agree.
+  const inputModalities: string[] = ["text"];
+  if (m.capabilities.input.image) inputModalities.push("image");
+  if (m.capabilities.input.audio) inputModalities.push("audio");
+  if (m.capabilities.input.video) inputModalities.push("video");
+  if (m.capabilities.input.pdf) inputModalities.push("pdf");
+  const outputModalities: string[] = ["text"];
+  if (m.capabilities.output.image) outputModalities.push("image");
+  if (m.capabilities.output.audio) outputModalities.push("audio");
+  if (m.capabilities.output.video) outputModalities.push("video");
+  if (m.capabilities.output.pdf) outputModalities.push("pdf");
+
   const entry: Record<string, unknown> = {
     id: m.id,
     name: m.name,
@@ -646,6 +664,10 @@ function toConfigModelEntry(m: OpenCodeModel): Record<string, unknown> {
     reasoning: m.capabilities.reasoning,
     attachment: m.capabilities.attachment,
     tool_call: m.capabilities.toolcall,
+    modalities: {
+      input: inputModalities,
+      output: outputModalities
+    },
     limit: {
       context: m.limit.context,
       output: m.limit.output,
@@ -1126,6 +1148,112 @@ function singleOrUndefined<T>(values: T[] | undefined): T | undefined {
   return values?.length === 1 ? values[0] : undefined;
 }
 
+/**
+ * Apply user-supplied static model overrides (in opencode's legacy
+ * config-schema shape – `attachment`, `tool_call`, `modalities`, `limit`,
+ * etc.) onto a fully-built OpenCodeModel (ModelV2 shape with nested
+ * `capabilities.input.image`).  This is necessary because the provider.models
+ * hook must return OpenCodeModel-shape objects, but users write static
+ * overrides in the simpler config schema (which is what
+ * https://opencode.ai/config.json validates).
+ *
+ * Without this translation a static `{ attachment: true }` would shallow-
+ * replace the dynamic OpenCodeModel and OpenCode would lose
+ * `capabilities.input.image`, leaving image input blocked even though the
+ * user explicitly enabled attachments.
+ */
+function applyStaticModelOverride(
+  base: OpenCodeModel,
+  overrideRaw: unknown
+): OpenCodeModel {
+  if (!isObjectRecord(overrideRaw)) return base;
+  const override = overrideRaw as Record<string, unknown>;
+  const next: OpenCodeModel = {
+    ...base,
+    capabilities: {
+      ...base.capabilities,
+      input: { ...base.capabilities.input },
+      output: { ...base.capabilities.output }
+    },
+    limit: { ...base.limit },
+    cost: { ...base.cost, cache: { ...base.cost.cache } },
+    options: { ...base.options },
+    headers: { ...base.headers }
+  };
+
+  if (typeof override.id === "string") next.id = override.id;
+  if (typeof override.name === "string") next.name = override.name;
+  if (typeof override.family === "string") next.family = override.family;
+  if (typeof override.release_date === "string") next.release_date = override.release_date;
+  if (override.status === "alpha" || override.status === "beta" || override.status === "deprecated" || override.status === "active") {
+    next.status = override.status;
+  }
+
+  if (typeof override.attachment === "boolean") {
+    next.capabilities.attachment = override.attachment;
+    next.capabilities.input.image = override.attachment;
+    next.capabilities.input.pdf = override.attachment;
+  }
+  if (typeof override.reasoning === "boolean") {
+    next.capabilities.reasoning = override.reasoning;
+    next.capabilities.interleaved = override.reasoning;
+  }
+  if (typeof override.temperature === "boolean") next.capabilities.temperature = override.temperature;
+  if (typeof override.tool_call === "boolean") next.capabilities.toolcall = override.tool_call;
+
+  if (isObjectRecord(override.modalities)) {
+    const modalities = override.modalities as Record<string, unknown>;
+    if (Array.isArray(modalities.input)) {
+      const inputs = modalities.input as unknown[];
+      next.capabilities.input.text = inputs.includes("text");
+      next.capabilities.input.audio = inputs.includes("audio");
+      next.capabilities.input.image = inputs.includes("image");
+      next.capabilities.input.video = inputs.includes("video");
+      next.capabilities.input.pdf = inputs.includes("pdf");
+    }
+    if (Array.isArray(modalities.output)) {
+      const outputs = modalities.output as unknown[];
+      next.capabilities.output.text = outputs.includes("text");
+      next.capabilities.output.audio = outputs.includes("audio");
+      next.capabilities.output.image = outputs.includes("image");
+      next.capabilities.output.video = outputs.includes("video");
+      next.capabilities.output.pdf = outputs.includes("pdf");
+    }
+  }
+
+  if (isObjectRecord(override.limit)) {
+    const limit = override.limit as Record<string, unknown>;
+    if (typeof limit.context === "number" && Number.isFinite(limit.context) && limit.context > 0) {
+      next.limit.context = limit.context;
+    }
+    if (typeof limit.output === "number" && Number.isFinite(limit.output) && limit.output > 0) {
+      next.limit.output = limit.output;
+    }
+    if (typeof limit.input === "number" && Number.isFinite(limit.input) && limit.input > 0) {
+      next.limit.input = limit.input;
+    }
+  }
+
+  if (isObjectRecord(override.cost)) {
+    const cost = override.cost as Record<string, unknown>;
+    if (typeof cost.input === "number") next.cost.input = cost.input;
+    if (typeof cost.output === "number") next.cost.output = cost.output;
+    if (typeof cost.cache_read === "number") next.cost.cache.read = cost.cache_read;
+    if (typeof cost.cache_write === "number") next.cost.cache.write = cost.cache_write;
+  }
+
+  if (isObjectRecord(override.options)) {
+    next.options = { ...next.options, ...override.options };
+  }
+  if (isObjectRecord(override.headers)) {
+    for (const [k, v] of Object.entries(override.headers)) {
+      if (typeof v === "string") next.headers[k] = v;
+    }
+  }
+
+  return next;
+}
+
 function findEnrichedModel(
   modelId: string,
   providerId: string,
@@ -1439,10 +1567,26 @@ export function createOpenAICompatibleModelsPlugin(options: RouterPluginOptions 
               return acc;
             }, {});
 
-          const result = {
-            ...staticModels,
-            ...dynamicModels
-          };
+          // Static models configured by the user override fields on the
+          // dynamic ones.  Static entries are written in opencode's legacy
+          // config-schema shape (`attachment`, `tool_call`, `modalities`,
+          // `limit`, ...), so we translate them onto the fully-built
+          // OpenCodeModel (ModelV2 shape with nested `capabilities.input.image`)
+          // rather than shallow-replacing it.  Without this translation a
+          // static `{ attachment: true }` would clobber the full dynamic
+          // entry and OpenCode would lose `capabilities.input.image`,
+          // leaving image input blocked even though the user enabled it.
+          const result: Record<string, OpenCodeModel> = { ...dynamicModels };
+          for (const [modelId, override] of Object.entries(staticModels)) {
+            const base = result[modelId];
+            if (base) {
+              result[modelId] = applyStaticModelOverride(base, override);
+            } else {
+              // No matching dynamic model – pass through unchanged so that
+              // user-defined synthetic models still work (legacy behaviour).
+              result[modelId] = override;
+            }
+          }
           process.stderr.write(
             `[opencode-9router-plugin] models hook: returning ${Object.keys(result).length} total model(s)\n`
           );
